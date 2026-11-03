@@ -8,7 +8,7 @@ CONFIG = Path.home() / ".config/ai-limits/providers.json"
 
 DEFAULT_PROVIDERS = [
     {"id": "openai", "name": "ChatGPT", "icon": "👾", "source": "codex_rpc", "enabled": True},
-    {"id": "claude", "name": "Claude", "icon": "✴️", "source": "claude_cache", "enabled": True},
+    {"id": "claude-code", "name": "Claude Code", "icon": "✴️", "source": "claude_oauth", "enabled": True},
     {"id": "zai-coding", "name": "GLM", "icon": "ⓩ", "source": "glm_quota", "enabled": True},
     {"id": "deepseek", "name": "DeepSeek", "icon": "🐋", "source": "deepseek_balance", "enabled": False},
     {"id": "gemini", "name": "Gemini", "icon": "💎", "source": "usage_events", "enabled": False},
@@ -82,16 +82,17 @@ def cmd_remove(provider_id):
         print(f"❌ not found: {provider_id}")
 
 
-def cmd_add(provider_id, name=None, icon=None, source="usage_events"):
+def cmd_add(provider_id, name=None, icon=None, source=None):
     providers = load()
     if find(providers, provider_id):
         print(f"❌ already exists: {provider_id}")
         return
+    default = next((item for item in DEFAULT_PROVIDERS if item["id"] == provider_id), {})
     p = {
         "id": provider_id,
-        "name": name or provider_id.title(),
-        "icon": icon or "🔹",
-        "source": source,
+        "name": name or default.get("name") or provider_id.title(),
+        "icon": icon or default.get("icon") or "🔹",
+        "source": source or default.get("source", "usage_events"),
         "enabled": True,
     }
     providers.append(p)
@@ -109,7 +110,7 @@ def cmd_available():
 def main():
     if len(sys.argv) < 2:
         print("Usage: manage.py <command> [args]")
-        print("Commands: list, available, show <id>, hide <id>, remove <id>, add <id> [name] [icon]")
+        print("Commands: list, available, show <id>, hide <id>, remove <id>, add <id> [name] [icon] [source]")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -126,7 +127,8 @@ def main():
     elif cmd == "add" and len(sys.argv) > 2:
         name = sys.argv[3] if len(sys.argv) > 3 else None
         icon = sys.argv[4] if len(sys.argv) > 4 else None
-        cmd_add(sys.argv[2], name, icon)
+        source = sys.argv[5] if len(sys.argv) > 5 else None
+        cmd_add(sys.argv[2], name, icon, source)
     else:
         print("Unknown command")
 

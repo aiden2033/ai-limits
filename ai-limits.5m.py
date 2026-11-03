@@ -3,7 +3,10 @@
 # <xbar.version>v4.0.0</xbar.version>
 # <xbar.desc>Multi-provider AI subscription limits</xbar.desc>
 
+import sys
 from pathlib import Path
+
+sys.path.append(str(Path.home() / ".ai-limits-bin"))
 
 from ai_limits_core import (
     bar,
@@ -37,6 +40,13 @@ def render_manage_menu():
             f'----🗑️ Remove | shell={MANAGE_SCRIPT} '
             f'param1=remove param2={provider["id"]} terminal=false refresh=true'
         )
+
+    if not any(provider.get("source") in {"claude_cache", "claude_oauth"} for provider in all_providers):
+        lines.extend([
+            "--➕ Подключить",
+            f'----✴️ Claude Code | shell={MANAGE_SCRIPT} '
+            'param1=add param2=claude-code terminal=false refresh=true',
+        ])
 
     return lines
 
@@ -92,7 +102,10 @@ def render_provider(provider, data):
     elif week_reset_ts:
         lines.append(f'  7d resets in {time_until_ts(week_reset_ts)} | size=11 font=:menlo: color=#888')
 
-    return lines
+    if data.get("quota_warning"):
+        lines.append(f'  {data["quota_warning"]} | size=11 font=:menlo: color=#ff9f0a')
+
+    return lines or [f"{icon} {name}: нет данных | font=:menlo: color=#888"]
 
 
 def render():

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import math
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,7 +18,10 @@ from urllib.request import Request, urlopen
 
 MSK = timezone(timedelta(hours=3))
 USAGE_EVENTS = Path.home() / ".codex/codex-router/usage-events.jsonl"
-CLAUDE_CONFIG = Path.home() / ".claude.json"
+CLAUDE_CREDENTIALS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / ".credentials.json"
+CLAUDE_QUOTA_CACHE = Path.home() / ".config/ai-limits/claude-quota.json"
+CLAUDE_QUOTA_CACHE_MAX_AGE = 15 * 60
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 MACOS_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 CODEX_BIN = os.environ.get("AI_LIMITS_CODEX_BIN") or shutil.which("codex") or MACOS_CODEX_BIN
 CURL_BIN = os.environ.get("AI_LIMITS_CURL_BIN") or shutil.which("curl")
@@ -182,19 +188,115 @@ def get_codex_rpc_limits(codex_bin=CODEX_BIN):
         return {}
 
 
-def get_claude_data():
-    config = load_json_file(CLAUDE_CONFIG) or {}
-    usage = config.get("cachedUsageUtilization", {}).get("utilization", {})
-    five_hour = usage.get("five_hour", {})
-    seven_day = usage.get("seven_day", {})
-    h5_used = five_hour.get("utilization", 0)
-    week_used = seven_day.get("utilization", 0)
-    return {
-        "h5_pct": 100 - h5_used if h5_used else None,
-        "week_pct": 100 - week_used if week_used else None,
-        "h5_reset": five_hour.get("resets_at"),
-        "week_reset": seven_day.get("resets_at"),
+def load_claude_keychain_credentials():
+    if sys.platform != "darwin":
+        return None
+    try:
+        response = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return json.loads(response.stdout) if response.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def get_claude_access_token():
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if token:
+        return token
+    for load in (lambda: load_json_file(CLAUDE_CREDENTIALS), load_claude_keychain_credentials):
+        credentials = load()
+        oauth = credentials.get("claudeAiOauth") if isinstance(credentials, dict) else None
+        token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+        if isinstance(token, str) and token:
+            return token
+    raise ValueError("Войди в Claude Code через claude auth login.")
+
+
+def parse_claude_limits(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Claude не вернул лимиты подписки.")
+    result = {}
+    limits = payload.get("limits")
+    limits = limits if isinstance(limits, list) else []
+    for prefix, field, kind in [("h5", "five_hour", "session"), ("week", "seven_day", "weekly_all")]:
+        window = payload.get(field)
+        if not isinstance(window, dict):
+            window = next((item for item in limits if isinstance(item, dict) and item.get("kind") == kind), {})
+        used = number(window.get("utilization", window.get("percent")))
+        if used is None:
+            continue
+        result[f"{prefix}_pct"] = round(100 - min(100, max(0, used)), 1)
+        reset = window.get("resets_at")
+        if isinstance(reset, str):
+            result[f"{prefix}_reset"] = reset
+    if not result:
+        raise ValueError("Claude не вернул лимиты подписки.")
+    return result
+
+
+def load_claude_quota_cache(token):
+    cached = load_json_file(CLAUDE_QUOTA_CACHE)
+    if not isinstance(cached, dict) or cached.get("credential_id") != hashlib.sha256(token.encode()).hexdigest():
+        return {}
+    fetched_at = number(cached.get("fetched_at"))
+    now = time.time()
+    if fetched_at is None or not 0 <= now - fetched_at <= CLAUDE_QUOTA_CACHE_MAX_AGE:
+        return {}
+    data = cached.get("data")
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for prefix in ("h5", "week"):
+        pct = number(data.get(f"{prefix}_pct"))
+        if pct is None or not 0 <= pct <= 100:
+            continue
+        reset = data.get(f"{prefix}_reset")
+        if reset is not None:
+            try:
+                if datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp() <= now:
+                    continue
+            except (ValueError, TypeError, AttributeError, OSError):
+                continue
+            result[f"{prefix}_reset"] = reset
+        result[f"{prefix}_pct"] = pct
+    return result
+
+
+def save_claude_quota_cache(token, data):
+    payload = {
+        "credential_id": hashlib.sha256(token.encode()).hexdigest(),
+        "fetched_at": time.time(),
+        "data": data,
     }
+    try:
+        CLAUDE_QUOTA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=CLAUDE_QUOTA_CACHE.parent,
+            prefix=".claude-quota-", suffix=".tmp", delete=False,
+        ) as temporary:
+            json.dump(payload, temporary)
+        Path(temporary.name).replace(CLAUDE_QUOTA_CACHE)
+    except OSError:
+        pass
+
+
+def get_claude_data():
+    try:
+        token = get_claude_access_token()
+    except ValueError as error:
+        return {"quota_error": str(error)}
+    try:
+        payload = request_json(CLAUDE_USAGE_URL, token, {"anthropic-beta": "oauth-2025-04-20"})
+        data = parse_claude_limits(payload)
+        save_claude_quota_cache(token, data)
+        return data
+    except (ValueError, OSError, TypeError) as error:
+        cached = load_claude_quota_cache(token)
+        if cached:
+            return {**cached, "quota_warning": f"Сохранённые лимиты: {safe_error(error, 'Claude')}"}
+        return {"quota_error": safe_error(error, "Claude")}
 
 
 def get_usage_data(provider_id):
@@ -385,6 +487,7 @@ def fetch_provider_data(provider):
     return {
         "codex_rpc": lambda: {**get_usage_data("openai"), **get_codex_rpc_limits()},
         "claude_cache": get_claude_data,
+        "claude_oauth": get_claude_data,
         "glm_quota": get_glm_limits,
         "deepseek_balance": get_deepseek_balance,
     }.get(source, lambda: get_usage_data(provider_id))()
@@ -457,6 +560,8 @@ def provider_status(data):
     if reset:
         suffix = time_until_iso(reset) if isinstance(reset, str) else time_until_ts(reset)
         parts.append(f"reset {suffix}")
+    if data.get("quota_warning"):
+        parts.append(str(data["quota_warning"]))
     return " · ".join(parts) if parts else "нет данных"
 
 
