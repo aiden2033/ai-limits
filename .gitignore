@@ -2,3 +2,6 @@ __pycache__/
 .venv/
 *.secret
 .DS_Store
+build/
+dist/
+*.spec

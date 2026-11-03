@@ -1,0 +1,74 @@
+name: AI Limits Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest -v
+
+  package-macos:
+    needs: tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: /bin/bash scripts/package_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-limits-macos
+          path: dist/ai-limits-macos.zip*
+          if-no-files-found: error
+
+  package-windows:
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pyinstaller -r windows/requirements.txt
+      - run: >
+          python -m PyInstaller --clean --noconfirm --onefile --windowed
+          --name ai-limits --distpath dist --workpath build --specpath build
+          --paths . windows/ai_limits_tray.py
+      - run: python scripts/package_windows.py dist/ai-limits.exe dist/ai-limits-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-limits-windows
+          path: dist/ai-limits-windows.zip*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - package-macos
+      - package-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate-release-notes: true
