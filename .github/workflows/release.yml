@@ -71,4 +71,4 @@ jobs:
           files: |
             dist/*.zip
             dist/*.sha256
-          generate-release-notes: true
+          generate_release_notes: true
